@@ -1,0 +1,112 @@
+{
+  "mode": "local_simulation",
+  "automatic_trading_enabled": true,
+  "market": {
+    "provider": "tqsdk",
+    "main_symbol": "KQ.m@CFFEX.IF",
+    "order_contract_rule": "resolve_to_actual_month_contract",
+    "timezone": "Asia/Shanghai",
+    "probe_seconds": 20,
+    "probe_timeout_seconds": 90,
+    "history_bars": 2400
+  },
+  "account": {
+    "initial_balance_cny": 1000000,
+    "max_position_contracts": 1,
+    "planned_risk_per_trade_cny": 5000,
+    "daily_loss_stop_new_entries_cny": 20000,
+    "daily_loss_includes_unrealized": true,
+    "allow_overnight": true,
+    "allow_weekend_hold": true,
+    "allow_holiday_hold": true
+  },
+  "risk_policy": {
+    "ai_may_override_program_limits": false,
+    "contract_expiry": {
+      "block_new_entries_minutes_before_expiry": 1440,
+      "close_position_minutes_before_expiry": 60
+    },
+    "market_closure": {
+      "treatment": "risk_factor",
+      "position_decision": "ai",
+      "automatic_calendar_exit": false,
+      "review_before_close": true,
+      "review_after_reopen": true,
+      "assessment_factors": [
+        "closure_duration",
+        "opening_gap_risk",
+        "volatility",
+        "liquidity",
+        "unrealized_profit_loss",
+        "margin_buffer",
+        "known_events_if_available",
+        "information_gaps"
+      ]
+    }
+  },
+  "simulation_policy": {
+    "cost_estimation": "conservative_labeled_assumptions",
+    "assumption_version": "conservative-v1",
+    "assumption_label": "项目保守假设，非交易所或期货公司实际收费承诺",
+    "fee_rates": {
+      "open": 0.00005,
+      "close_today": 0.0005,
+      "close_previous": 0.00005
+    },
+    "broker_commission_cny_per_side": 20,
+    "slippage_ticks": 2,
+    "margin_rate": 0.20,
+    "assumption_label_required": true,
+    "fee_components": [
+      "exchange_fee_assumption",
+      "broker_commission_assumption"
+    ],
+    "separate_open_close_today_close_previous_fees": true,
+    "missing_cost_assumptions": "mark_unpriced_and_block_new_entries",
+    "execution_price_reference": "opposite_best_quote",
+    "spread_accounting": "included_in_execution_price_not_charged_twice",
+    "additional_slippage_direction": "adverse",
+    "require_fresh_quote_and_executable_liquidity": true,
+    "respect_order_limit_and_exchange_price_limits": true,
+    "stop_fill_reference": "first_executable_quote_after_trigger",
+    "record_assumption_version_per_trade": true,
+    "report_gross_and_net_pnl": true,
+    "strategy_may_modify_cost_assumptions": false,
+    "compare_strategies_with_same_cost_assumptions": true,
+    "rewrite_historical_costs_on_parameter_change": false
+  },
+  "model": {
+    "provider": "openai",
+    "project_id": "proj_x95YkczQfbRBdf5za19kFf7r",
+    "api_key_name": "futures-local-luna",
+    "model": "gpt-6-luna",
+    "endpoint": "https://api.openai.com/v1/responses",
+    "reasoning_effort": "low",
+    "analysis_interval_seconds": 60,
+    "max_output_tokens": 2048,
+    "daily_budget_usd": 2,
+    "input_usd_per_million_tokens": 0.1,
+    "output_usd_per_million_tokens": 0.5,
+    "request_timeout_seconds": 30,
+    "store": false
+  },
+  "evolution": {
+    "enabled": true,
+    "minimum_historical_bars": 600,
+    "min_validation_trades": 10,
+    "min_shadow_trades": 10,
+    "min_shadow_days": 3,
+    "max_candidates_per_review": 2,
+    "review_interval_hours": 24,
+    "minimum_net_profit_improvement_cny": 100,
+    "maximum_drawdown_ratio": 1.0
+  },
+  "app": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "database": "data/futures.sqlite3",
+    "review_time": "15:10",
+    "reopen_review_minutes": 5
+  },
+  "stage": "paper_trading"
+}
