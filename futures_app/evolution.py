@@ -18,7 +18,7 @@ import time
 import uuid
 
 from .strategy import (CHINA, PARAMETER_BOUNDS, aggregate_five_minute, baseline_decision,
-                       build_context, closed_bars, default_strategy, finite_number,
+                       build_context, closed_bars, default_strategy, finite_number, protection_prices,
                        timestamp, validate_parameters)
 
 
@@ -93,6 +93,7 @@ def _close(book: dict, quote: dict, costs: dict) -> None:
     book["fees"] += fee
     book["trades"] += 1
     book["wins"] += int(gross - fee - position["entry_fee"] > 0)
+    book["last_close"] = {"at": timestamp(quote["datetime"]), "net_pnl": gross - fee - position["entry_fee"]}
     book["position"] = None
     _mark(book, quote)
 
@@ -147,14 +148,26 @@ def _paper_step(book: dict, strategy: dict, quote: dict, bars1: list, bars5: lis
             _close(book, quote, costs)
             return
         if decision["action"].startswith("open_") and not book["position"] and not blocked:
+            policy = strategy.get("execution", {})
+            last_close = book.get("last_close", {})
+            if (last_close.get("net_pnl", 0) < 0
+                    and as_of - last_close["at"] < policy.get("loss_cooldown_minutes", 0) * 60):
+                return
             direction = 1 if decision["action"] == "open_long" else -1
             touch = quote["ask_price1"] if direction == 1 else quote["bid_price1"]
             price = touch + direction * costs["slippage_ticks"] * 0.2
+            if decision.get("rule_plan"):
+                decision["stop_loss"], decision["take_profit"] = protection_prices(
+                    price, 0.2, direction, context["indicators"]["atr1"], strategy["parameters"])
             fee = _fee(price, "open", costs)
             exit_allowance = quote["ask_price1"] - quote["bid_price1"] + costs["slippage_ticks"] * 0.2
             stop_fill = decision["stop_loss"] - direction * exit_allowance
             closing_kind = max(("close_today", "close_previous"), key=lambda key: costs["fee_rates"][key])
             stop_risk = abs(price - stop_fill) * 300 + fee + _fee(stop_fill, closing_kind, costs)
+            target_fill = decision["take_profit"] - direction * exit_allowance
+            target_net = (target_fill - price) * direction * 300 - fee - _fee(target_fill, closing_kind, costs)
+            if policy and target_net < stop_risk * policy["minimum_net_reward_risk"]:
+                return
             equity = account.get("initial_balance_cny", 1000000) + book["net_pnl"]
             last_price = quote.get("last_price", (quote["bid_price1"] + quote["ask_price1"]) / 2)
             equity_after = equity - fee + (last_price - price) * direction * 300

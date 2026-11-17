@@ -15,11 +15,13 @@ from .calendar import ExchangeCalendar
 from .common import ROOT, connect_db, iso_now, now_china, parse_time, safe_json
 from .evolution import StrategyEvolution
 from .feed import MarketFeed
+from .daily_rules import DAILY_BOUNDS, DailyRules
+from .global_market import GlobalMarketFeed
 from .strategy import baseline_decision, build_context
 
 
 class TradingService:
-    def __init__(self, root: Path = ROOT, *, feed=None, broker=None, analyst=None, evolution=None):
+    def __init__(self, root: Path = ROOT, *, feed=None, broker=None, analyst=None, evolution=None, global_feed=None):
         self.root = Path(root)
         self.config = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
         self.db_path = self.root / self.config.get("app", {}).get("database", "data/futures.sqlite3")
@@ -35,6 +37,9 @@ class TradingService:
         self.broker = broker or PaperBroker(self.db_path, self.config)
         self.analyst = analyst or LunaAnalyst(self.db_path, self.config)
         self.evolution = evolution or StrategyEvolution(self.db_path, self.config)
+        self.daily_enabled = bool(self.config.get("daily_rules", {}).get("enabled", False))
+        self.daily_rules = DailyRules(self.db_path, self.config["daily_rules"]) if self.daily_enabled else None
+        self.global_feed = global_feed or GlobalMarketFeed(self.config.get("daily_rules", {}))
         row = self.db.execute("SELECT value FROM app_settings WHERE key='running'").fetchone()
         running = bool(json.loads(row[0])) if row else bool(self.config.get("automatic_trading_enabled", False))
         self.runtime = {"running": running, "started_at": iso_now(), "last_error": None, "model_busy": False}
@@ -46,10 +51,13 @@ class TradingService:
         self._last_signal_check = 0.0
         row = self.db.execute("SELECT value FROM app_settings WHERE key='last_signal_review'").fetchone()
         self._last_signal_review = json.loads(row[0]) if row else None
+        row = self.db.execute("SELECT value FROM app_settings WHERE key='last_rule_signal'").fetchone()
+        self._last_rule_signal = json.loads(row[0]) if row else None
         self._last_quote_key = None
         self._last_risk_check = 0.0
         self._last_error_time = 0.0
         self._last_review_check = 0.0
+        self._last_daily_check = 0.0
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
@@ -59,6 +67,8 @@ class TradingService:
         self._thread = threading.Thread(target=self._run, name="paper-trading-risk-loop", daemon=True)
         self._thread.start()
         self.broker.record_event("system", "本地模拟服务已启动，账户与持仓从账本恢复。")
+        if self.daily_enabled:
+            self.request_daily_rules()
 
     def stop(self) -> None:
         self._stop.set()
@@ -91,7 +101,8 @@ class TradingService:
     def _context(self, market: dict, calendar: dict, quote: dict) -> dict:
         account = self.broker.snapshot(quote or None)
         position = account.get("position")
-        strategy = self.evolution.current_strategy()
+        daily = self.daily_rules.state(now_china().date().isoformat()) if self.daily_enabled else None
+        strategy = daily["strategy"] if daily else self.evolution.current_strategy()
         if position and position.get("strategy_version"):
             strategy = self.evolution.strategy_for_version(position["strategy_version"])
         context = build_context(
@@ -103,12 +114,18 @@ class TradingService:
         context["information_gaps"] = [calendar["known_events_note"]]
         if not context["execution_allowed"]:
             context["eligible_actions"] = ["hold"]
+        elif daily and not daily["active"] and not position:
+            context["eligible_actions"] = ["hold"]
+            context["data_note"] = "今日规则准备中，等待生成完成。"
         return context
 
     def _run(self) -> None:
         while not self._stop.wait(0.5):
             try:
                 market, calendar, quote = self._market()
+                if self.daily_enabled and time.monotonic() - self._last_daily_check >= 30:
+                    self._last_daily_check = time.monotonic()
+                    self.request_daily_rules()
                 if quote.get("datetime"):
                     key = tuple(quote.get(field) for field in (
                         "symbol", "datetime", "last_price", "bid_price1", "ask_price1", "bid_volume1", "ask_volume1", "settlement"
@@ -124,7 +141,7 @@ class TradingService:
                         if changed:
                             self.evolution.observe(quote, market.get("bars_1m", []), market.get("bars_5m", []))
                 interval = self.config["model"]["analysis_interval_seconds"]
-                if self.runtime["running"] and not self.runtime["model_busy"] and calendar["session_open"] and market.get("quote_is_fresh") and market.get("status") == "connected":
+                if self.runtime["running"] and (self.daily_enabled or not self.runtime["model_busy"]) and calendar["session_open"] and market.get("quote_is_fresh") and market.get("status") == "connected":
                     if time.monotonic() - self._last_signal_check >= interval:
                         self._last_signal_check = time.monotonic()
                         self.request_analysis(signal_only=True)
@@ -165,7 +182,7 @@ class TradingService:
                 with self._lock:
                     self.ai_state["status"] = "模型任务失败，程序风控继续运行"
                     self.runtime["last_error"] = f"模型任务失败（{type(exc).__name__}）"
-                self.broker.record_event("error", "模型任务失败，未新增仓位。", {"error_code": type(exc).__name__})
+                self.broker.record_event("error", "模型任务失败，程序风控继续运行。", {"error_code": type(exc).__name__})
             finally:
                 with self._lock:
                     self.runtime["model_busy"] = False
@@ -197,6 +214,8 @@ class TradingService:
         return context, key
 
     def request_analysis(self, *, signal_only: bool = False) -> dict:
+        if self.daily_enabled:
+            return self._execute_rules() if signal_only else self.request_daily_rules(force=True)
         market, calendar, quote = self._market()
         if not quote.get("datetime") or not market.get("bars_1m"):
             return {"status": "blocked", "message": "等待行情和K线就绪。"}
@@ -253,6 +272,83 @@ class TradingService:
 
         return self._launch_model_job(task, "Luna 正在审核信号" if signal_only else "Luna 正在分析")
 
+    def request_daily_rules(self, *, force: bool = False) -> dict:
+        calendar = self.calendar.context()
+        if not calendar.get("is_trading_day") or not calendar.get("calendar_verified"):
+            return {"status": "skipped", "message": "等待已核验的交易日生成今日规则。"}
+        day = now_china().date().isoformat()
+        daily = self.daily_rules.state(day)
+        if daily["status"] == "ready":
+            return {"status": "ok", "message": "已复用今日规则 " + daily["strategy"]["version"]}
+        if not force and (daily.get("next_attempt_at", 0) > time.time()
+                          or (daily["status"] != "generating" and daily["attempts"] >= self.config["daily_rules"].get("max_attempts_per_day", 3))):
+            return {"status": "skipped", "message": daily["message"]}
+
+        def task():
+            token = self.daily_rules.claim(day, force=force)
+            if token is None:
+                return
+            market = {}
+            try:
+                market = self.global_feed.collect()
+                key = get_secret("OPENAI_API_KEY")
+                if not market.get("available_count"):
+                    response = {"status": "failed", "error_code": "GLOBAL_MARKET_UNAVAILABLE"}
+                elif not key:
+                    response = {"status": "failed", "error_code": "MISSING_MODEL_KEY"}
+                else:
+                    response = self.analyst.generate_daily_rules({
+                        "trading_day": day, "base_strategy": self.daily_rules.base,
+                        "allowed_parameters": {name: {"min": bounds[0], "max": bounds[1], "integer": bounds[2] is int}
+                                               for name, bounds in DAILY_BOUNDS.items()},
+                        "global_market": market, "calendar": calendar,
+                        "risk_limits": self.config["account"], "cost_assumptions": self.config["simulation_policy"],
+                    }, key)
+            except Exception as exc:
+                response = {"status": "failed", "error_code": type(exc).__name__}
+            daily = self.daily_rules.finish(day, token, market, response)
+            self.broker.record_event("daily_rules", daily["message"],
+                                     {"version": daily["strategy"]["version"], "status": daily["status"],
+                                      "changes": daily.get("changes", []), "error_code": daily.get("error_code")})
+            with self._lock:
+                self.ai_state["status"] = daily["message"]
+
+        return self._launch_model_job(task, "Luna 正在生成今日规则")
+
+    def _execute_rules(self) -> dict:
+        market, calendar, quote = self._market()
+        if not self.runtime["running"] or not quote.get("datetime") or not market.get("bars_1m"):
+            return {"status": "skipped", "message": "等待自动模拟运行及行情就绪。"}
+        context = self._context(market, calendar, quote)
+        decision = baseline_decision(context)
+        bar = context.get("indicators", {}).get("last_closed_1m", {})
+        position = context.get("broker", {}).get("position") or {}
+        if (decision["action"] == "hold" or not context.get("execution_allowed")
+                or decision["action"] not in context["eligible_actions"] or not bar.get("datetime")):
+            return {"status": "skipped", "message": context.get("data_note", "等待规则信号。")}
+        signal = json.dumps([quote.get("symbol"), context["strategy"]["version"], bar["datetime"],
+                             decision["action"], position.get("opened_at")], ensure_ascii=False)
+        with self._lock:
+            if signal == self._last_rule_signal or not self.runtime["running"]:
+                return {"status": "skipped", "message": "该规则信号已处理，等待下一根K线。"}
+            self._last_rule_signal = signal
+            self.db.execute("INSERT OR REPLACE INTO app_settings VALUES('last_rule_signal',?)", (json.dumps(signal),))
+            self.db.commit()
+            decision.update(origin="rules", status="ok", created_at=iso_now())
+            result = self.broker.execute(decision, quote, context.get("indicators"))
+            if result.get("status") == "executed" and decision["action"].startswith("open_"):
+                filled_position = result.get("position") or {}
+                decision.update({key: filled_position[key] for key in ("stop_loss", "take_profit") if key in filled_position})
+            decision["execution"] = {key: result.get(key) for key in ("status", "reason")}
+            self.ai_state["last_decision"] = decision
+            self.db.execute("INSERT OR REPLACE INTO app_settings VALUES('last_decision',?)",
+                            (json.dumps(safe_json(decision), ensure_ascii=False),))
+            self.db.commit()
+        self.broker.record_event("rule_signal", result.get("reason", decision["reason"]),
+                                 {"action": decision["action"], "version": decision["strategy_version"],
+                                  "status": result.get("status")})
+        return result
+
     def request_review(self) -> dict:
         market, calendar, quote = self._market()
         if not market.get("bars_1m"):
@@ -287,10 +383,11 @@ class TradingService:
                 with self._lock:
                     self.db.execute("INSERT INTO app_reviews(trading_day,created_at,payload) VALUES(?,?,?)", (day, iso_now(), json.dumps(safe_json(review), ensure_ascii=False)))
                     self.db.commit()
-                self.broker.record_event("review", "当日复盘已保存，开始检查策略改进候选。")
+                self.broker.record_event("review", "当日复盘已保存。")
                 try:
-                    evolution = self.evolution.maybe_review(history, market.get("bars_1m", []), key, self.analyst)
-                    self.broker.record_event("strategy", "策略候选检查完成。", safe_json(evolution))
+                    if not self.daily_enabled:
+                        evolution = self.evolution.maybe_review(history, market.get("bars_1m", []), key, self.analyst)
+                        self.broker.record_event("strategy", "策略候选检查完成。", safe_json(evolution))
                 except Exception as exc:
                     self.broker.record_event("strategy", "策略检查暂未完成，继续沿用当前版本。", {"error_code": type(exc).__name__})
                 with self._lock:
@@ -337,6 +434,13 @@ class TradingService:
             ai = copy.deepcopy(self.ai_state)
             rows = self.db.execute("SELECT id,trading_day,created_at,payload FROM app_reviews ORDER BY id DESC LIMIT 20").fetchall()
         ai.update(usage=self.analyst.usage_today(), decisions=self.analyst.recent_decisions(limit=30), model=self.config["model"]["model"])
+        strategy = self.evolution.state()
+        if self.daily_enabled:
+            daily = self.daily_rules.state(now_china().date().isoformat())
+            ai["daily_rules"] = daily
+            runtime["daily_rules_ready"] = daily["active"]
+            strategy.update(current=daily["strategy"], base=daily["base"], daily=daily, mode="daily",
+                            last_review={"message": daily["message"]})
         if ai["last_decision"] is None and ai["decisions"]:
             ai["last_decision"] = ai["decisions"][0]
         reviews = [{"id": row["id"], "trading_day": row["trading_day"], "created_at": row["created_at"], **json.loads(row["payload"])} for row in rows]
@@ -348,7 +452,7 @@ class TradingService:
             "runtime": runtime, "account": snapshot.get("account", {}), "position": snapshot.get("position"),
             "orders": history.get("orders", []), "trades": history.get("trades", []),
             "equity_curve": history.get("equity_curve", history.get("equity", [])),
-            "ai": ai, "strategy": self.evolution.state(), "reviews": reviews,
+            "ai": ai, "strategy": strategy, "reviews": reviews,
             "risk_limits": self.config["account"], "cost_assumptions": self.config["simulation_policy"],
             "events": self.broker.events(limit=80),
         })

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import urllib.error
 
 from futures_app.ai import LunaAnalyst, validate_decision
+from futures_app.strategy import base_strategy_v2
 
 
 def context():
@@ -44,6 +45,25 @@ class AnalystTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "test.sqlite3"
         self.analyst = LunaAnalyst(self.path, {"model": "gpt-6-luna", "daily_budget_usd": 2})
+
+    def test_daily_generation_is_structured_and_rejects_unsupported_changes(self):
+        daily_context = {"base_strategy": base_strategy_v2(), "global_market": {
+            "factors": [{"id": "vix", "status": "available"}]}}
+        proposal = {"regime": "volatile", "summary": "波动升高，延长亏损后的等待时间。",
+                    "changes": [{"parameter": "loss_cooldown_minutes", "value": 20}],
+                    "evidence": [{"factor": "vix", "interpretation": "波动率上升。"}], "limitations": []}
+        opener = FakeOpener(response(proposal))
+        with patch("urllib.request.build_opener", return_value=opener):
+            result = self.analyst.generate_daily_rules(daily_context, "synthetic-key-only")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(json.loads(opener.request.data)["text"]["format"]["name"], "futures_daily_rules")
+        for update in ({"changes": [{"parameter": "max_contracts", "value": 2}]},
+                       {"evidence": [{"factor": "china_a50", "interpretation": "unavailable"}]},
+                       {"changes": [None]}, {"evidence": []}):
+            with patch("urllib.request.build_opener", return_value=FakeOpener(response({**proposal, **update}))):
+                invalid = self.analyst.generate_daily_rules(daily_context, "synthetic-key-only")
+            self.assertEqual(invalid["error_code"], "DAILY_RULES_INVALID")
+            self.assertNotIn("result", invalid)
 
     def test_structured_call_and_reasoning_cost_are_counted_once(self):
         opener = FakeOpener(response())

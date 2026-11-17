@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import math
 
 CHINA = timezone(timedelta(hours=8))
@@ -11,6 +12,10 @@ PARAMETER_BOUNDS = {
     "entry_ma": (3, 12, int), "atr_period": (8, 24, int),
     "stop_atr": (1.0, 3.0, float), "reward_risk": (1.2, 3.0, float),
     "pullback_atr": (0.1, 0.8, float), "min_trend_atr": (0.05, 0.5, float),
+}
+EXECUTION_BOUNDS = {
+    "loss_cooldown_minutes": (10, 60, int),
+    "minimum_net_reward_risk": (1.2, 2.5, float),
 }
 
 
@@ -22,6 +27,35 @@ def default_strategy() -> dict:
                        "pullback_atr": 0.4, "min_trend_atr": 0.15},
         "description": "仅使用已完成K线；5分钟判断方向，1分钟回调确认，AI复核后方可开仓。",
     }
+
+
+def base_strategy_v2() -> dict:
+    strategy = default_strategy()
+    strategy.update(version="trend-v2", name="v2 趋势与回调",
+                    description="规则统一计算信号与保护价，执行扣费后盈亏比检查和亏损后冷却。",
+                    execution={"loss_cooldown_minutes": 10, "minimum_net_reward_risk": 1.2})
+    return strategy
+
+
+def validate_execution(values: dict) -> dict:
+    if not isinstance(values, dict) or set(values) != set(EXECUTION_BOUNDS):
+        raise ValueError("Incomplete execution policy")
+    result = {}
+    for name, (lower, upper, kind) in EXECUTION_BOUNDS.items():
+        value = values[name]
+        if not finite_number(value) or not lower <= value <= upper or (kind is int and value != int(value)):
+            raise ValueError("Execution parameter out of range")
+        result[name] = kind(value)
+    return result
+
+
+def protection_prices(price, tick, direction: int, atr, parameters: dict) -> tuple[float, float]:
+    price, tick = Decimal(str(price)), Decimal(str(tick))
+    distance = Decimal(str(atr)) * Decimal(str(parameters["stop_atr"]))
+    reward = distance * Decimal(str(parameters["reward_risk"]))
+    stop = ((price - direction * distance) / tick).to_integral_value() * tick
+    target = ((price + direction * reward) / tick).to_integral_value() * tick
+    return float(stop), float(target)
 
 
 def finite_number(value) -> bool:
@@ -148,7 +182,12 @@ def build_context(quote: dict, bars1: list, bars5: list, broker_snapshot: dict,
                         "calendar_forced_exit": False, "program_limits_override_ai": True},
     }
     if not ready:
-        context["data_note"] = "已完成K线不足；暂停新开仓，已有持仓继续程序风控与AI退出评估。"
+        context["data_note"] = "已完成K线不足，等待新开仓条件，已有持仓继续程序风控。"
+        return context
+    if strategy.get("execution") and (as_of - one[-1]["datetime"] - 60 > 60
+                                       or as_of - five[-1]["datetime"] - 300 > 300):
+        context["data_ready"] = False
+        context["data_note"] = "等待当前交易时段的新鲜已完成K线。"
         return context
     close1 = [row["close"] for row in one]
     close5 = [row["close"] for row in five]
@@ -186,13 +225,13 @@ def build_context(quote: dict, bars1: list, bars5: list, broker_snapshot: dict,
 
 
 def baseline_decision(context: dict) -> dict:
-    """Rule-only benchmark for independent evaluations, never an AI substitute."""
+    """Shared deterministic proposal for execution and strategy evaluation."""
     strategy = context["strategy"]
     parameters = strategy["parameters"]
     position = context.get("broker", {}).get("position")
     decision = {"action": "hold", "stop_loss": None, "take_profit": None,
                 "reason": "规则基线观察", "risk_level": "medium",
-                "closure_assessment": "独立基线未接入事件判断；不因休市日期自动平仓。",
+                "closure_assessment": "允许跨休市持仓，按开仓保护计划及程序风控管理。",
                 "strategy_version": strategy["version"]}
     if position:
         if context["signal"] in {"long", "short"} and context["signal"] != position.get("side"):
@@ -212,4 +251,7 @@ def baseline_decision(context: dict) -> dict:
     decision.update(action=action, stop_loss=round(round((price - direction * distance) / tick) * tick, 8),
                     take_profit=round(round((price + direction * distance * parameters["reward_risk"]) / tick) * tick, 8),
                     reason="5分钟趋势与1分钟回调满足规则")
+    if strategy.get("execution"):
+        decision["rule_plan"] = {"parameters": parameters, "execution": validate_execution(strategy["execution"]),
+                                 "atr": context["indicators"]["atr1"]}
     return decision

@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from futures_app.evolution import StrategyEvolution, _live_quote_valid, _new_book, _paper_step
-from futures_app.strategy import default_strategy
+from futures_app.strategy import base_strategy_v2, default_strategy
+from test_strategy import make_bars
 
 
 def config():
@@ -33,6 +34,32 @@ class EvolutionTests(unittest.TestCase):
         self.analyst = Mock()
         self.analyst.propose_parameters.return_value = {"status": "ok", "result": {
             "reason": "synthetic hypothesis", "changes": [{"parameter": "entry_ma", "value": 6}]}}
+
+    def test_v2_replay_applies_cooldown_and_fill_based_protection(self):
+        current = 1_800_000_000
+        one = make_bars(current - 60 * 60, 60)
+        for bar in one:
+            bar.update(high=bar["open"] + 3, low=bar["open"] - 3)
+        five = make_bars(current - 50 * 300, 50, 300)
+        quote = {"datetime": current, "symbol": "CFFEX.IF2612", "last_price": 4060,
+                 "bid_price1": 4059.8, "ask_price1": 4060.2}
+        for elapsed, allowed in ((599, False), (600, True)):
+            book = _new_book()
+            book["last_close"] = {"at": current - elapsed, "net_pnl": -1000}
+            _paper_step(book, base_strategy_v2(), quote, one, five, config()["simulation_policy"], {})
+            self.assertEqual(bool(book["position"]), allowed)
+            if allowed:
+                self.assertAlmostEqual(book["position"]["entry_price"], 4060.6)
+                self.assertEqual(book["position"]["stop_loss"], 4049.8)
+                self.assertEqual(book["position"]["take_profit"], 4082.2)
+
+    def test_v2_replay_rejects_low_net_ratio(self):
+        current = 1_800_000_000
+        quote = {"datetime": current, "symbol": "CFFEX.IF2612", "bid_price1": 4059.8, "ask_price1": 4060.2}
+        book = _new_book()
+        _paper_step(book, base_strategy_v2(), quote, make_bars(current - 60 * 60, 60),
+                    make_bars(current - 50 * 300, 50, 300), config()["simulation_policy"], {})
+        self.assertIsNone(book["position"])
 
     def test_insufficient_history_never_calls_model_or_changes_current(self):
         result = self.evolution.maybe_review([], bars()[:100], "synthetic", self.analyst)

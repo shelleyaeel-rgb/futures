@@ -76,6 +76,7 @@ class ServiceConcurrencyTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
         self.config["automatic_trading_enabled"] = False
+        self.config["daily_rules"]["enabled"] = False
         (root / "config.json").write_text(json.dumps(self.config), encoding="utf-8")
         (root / "calendar.json").write_bytes((ROOT / "calendar.json").read_bytes())
         self.feed, self.broker, self.analyst = Feed(), Broker(), Analyst()

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from futures_app.broker import PaperBroker, TZ
+from futures_app.strategy import base_strategy_v2
 
 
 def configuration():
@@ -73,6 +74,60 @@ class PaperBrokerTests(unittest.TestCase):
     def close_position(self, price=4010, **quote_changes):
         self.advance()
         return self.broker.execute(self.decision("close", stop=None), self.quote(price, **quote_changes))
+
+    def v2_decision(self, action="open_long", atr=5):
+        strategy = base_strategy_v2()
+        return self.decision(action, strategy_version=strategy["version"], origin="rules",
+                             rule_plan={"parameters": strategy["parameters"], "execution": strategy["execution"], "atr": atr})
+
+    def test_v2_protection_uses_actual_fill_and_audits_rule_plan(self):
+        result = self.broker.execute(self.v2_decision(), self.quote())
+        self.assertEqual(result["status"], "executed", result["reason"])
+        self.assertEqual(result["position"]["entry_price"], 4000.4)
+        self.assertEqual(result["position"]["stop_loss"], 3991.4)
+        self.assertEqual(result["position"]["take_profit"], 4018.4)
+        self.assertEqual(result["trade"]["origin"], "rules")
+        order = self.broker.history()["orders"][0]
+        self.assertEqual(order["decision"]["rule_plan"]["atr"], 5)
+        self.assertEqual(order["decision"]["stop_loss"], 3991.4)
+
+    def test_v2_short_protection_uses_actual_fill(self):
+        result = self.broker.execute(self.v2_decision("open_short"), self.quote())
+        self.assertEqual(result["status"], "executed", result["reason"])
+        self.assertEqual(result["position"]["entry_price"], 3999.4)
+        self.assertEqual(result["position"]["stop_loss"], 4008.4)
+        self.assertEqual(result["position"]["take_profit"], 3981.4)
+
+    def test_v2_rejects_low_net_ratio_and_invalid_plan(self):
+        result = self.broker.execute(self.v2_decision(atr=1), self.quote())
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("扣费后", result["reason"])
+        self.assertEqual(self.broker.history()["orders"][0]["origin"], "rules")
+        for plan in ({}, [], {"parameters": {}, "execution": {}, "atr": float("nan")}):
+            result = self.broker.execute({**self.v2_decision(), "rule_plan": plan}, self.quote())
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("校验失败", result["reason"])
+
+    def test_v2_loss_cooldown_survives_restart_and_blocks_both_directions(self):
+        self.open_long()
+        closed = self.close_position(3999)
+        self.assertLess(closed["trade"]["net_pnl"], 0)
+        self.restart()
+        self.advance(599)
+        for direction in ("open_long", "open_short"):
+            result = self.broker.execute(self.v2_decision(direction), self.quote())
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("冷却10分钟", result["reason"])
+        self.advance(1)
+        result = self.broker.execute(self.v2_decision(), self.quote())
+        self.assertEqual(result["status"], "executed", result["reason"])
+
+    def test_v2_profit_does_not_start_loss_cooldown(self):
+        self.open_long()
+        closed = self.close_position(4010)
+        self.assertGreater(closed["trade"]["net_pnl"], 0)
+        self.advance()
+        self.assertEqual(self.broker.execute(self.v2_decision(), self.quote())["status"], "executed")
 
     def test_long_pnl_fees_margin_and_spread_are_not_double_counted(self):
         opened = self.open_long()

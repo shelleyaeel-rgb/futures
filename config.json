@@ -90,8 +90,15 @@
     "request_timeout_seconds": 30,
     "store": false
   },
-  "evolution": {
+  "daily_rules": {
     "enabled": true,
+    "retry_interval_seconds": 300,
+    "max_attempts_per_day": 3,
+    "request_timeout_seconds": 10,
+    "max_observation_age_hours": 120
+  },
+  "evolution": {
+    "enabled": false,
     "minimum_historical_bars": 600,
     "min_validation_trades": 10,
     "min_shadow_trades": 10,

@@ -141,7 +141,7 @@
     model.busy = true;
     updateControls();
     if (action === 'close') $('close-confirm').hidden = true;
-    const messages = { start: '正在启动自动模拟…', pause: '正在暂停新开仓…', close: '正在提交模拟平仓…', analyze: '正在请求AI分析…', review: '正在生成交易复盘…', check: '正在读取连接与配置状态…' };
+    const messages = { start: '正在启动自动模拟…', pause: '正在暂停新开仓…', close: '正在提交模拟平仓…', analyze: model.state?.ai?.daily_rules ? '正在请求生成今日规则…' : '正在请求AI分析…', review: '正在生成交易复盘…', check: '正在读取连接与配置状态…' };
     notify(messages[action] || '正在处理…');
     try {
       if (!model.csrf) await bootstrap();
@@ -177,7 +177,9 @@
     $('start-button').disabled = !ready || model.busy || running;
     $('pause-button').disabled = !ready || model.busy || !running;
     $('check-button').disabled = model.busy;
-    $('analyze-button').disabled = !ready || model.busy || runtime.model_busy === true || ['analyzing', 'running'].includes(model.state?.ai?.status);
+    const daily = model.state?.ai?.daily_rules;
+    $('analyze-button').disabled = !ready || model.busy || runtime.model_busy === true || daily?.status === 'ready' || (daily && !model.state?.calendar?.is_trading_day) || ['analyzing', 'running'].includes(model.state?.ai?.status);
+    text('analyze-button', daily ? ({ ready: '今日规则已生成', generating: '生成中…', fallback: '重试生成' }[daily.status] || '生成今日规则') : '立即分析');
     $('review-button').disabled = !ready || model.busy || runtime.model_busy === true || model.state?.ai?.review_running === true;
     $('close-button').disabled = !ready || model.busy || !model.state?.position;
     $('confirm-close').disabled = model.busy;
@@ -195,6 +197,7 @@
     text('runtime-label', running ? '自动模拟运行中' : '自动模拟已暂停');
     text('runtime-description', running ? (open ? '按策略评估交易机会，独立风控持续检查持仓' : '当前休市，保留持仓并等待下一交易时段') : '暂停新开仓，已有持仓仍接受程序风控检查');
     if (account.entry_blocked) text('runtime-description', plain(first(account.entry_block_reason, account.block_reason)) || '风控限制已触发，暂停新开仓');
+    else if (running && state.ai?.daily_rules && !state.ai.daily_rules.active) text('runtime-description', '今日规则准备中，持仓保护持续运行');
     classed($('runtime-dot'), 'live', running && !account.entry_blocked);
     classed($('runtime-dot'), 'warning', !running || Boolean(account.entry_blocked));
     classed($('runtime-dot'), 'error', Boolean(runtime.last_error));
@@ -245,36 +248,43 @@
   }
 
   function renderAI(ai, calendar, runtime) {
-    const latestDecisions = array(ai.decisions).filter((record) => unpack(record).action);
-    const lastRaw = ai.last_decision && unpack(ai.last_decision).action ? ai.last_decision : latestDecisions[0];
-    const last = lastRaw ? unpack(lastRaw) : null;
-    const statusMap = { analyzing: '分析中', running: '分析中', ready: '就绪', idle: '等待下一次', paused: '已暂停', error: '调用异常', failed: '调用异常', budget_exhausted: '今日预算已满', budget_blocked: '预算受限', waiting: '等待分析', waiting_market: '等待行情', market_closed: '休市等待' };
-    const status = ai.status || (last ? 'idle' : 'waiting');
-    text('ai-status', statusMap[status] || status);
-    $('ai-status').className = 'badge ' + (['error', 'failed'].includes(status) || /失败|异常/.test(status) ? 'badge-red' : ['budget_exhausted', 'budget_blocked'].includes(status) || /预算/.test(status) ? 'badge-amber' : runtime.model_busy || ['analyzing', 'running'].includes(status) ? 'badge-blue loading-pulse' : 'badge-neutral');
-    text('decision-action', last ? actionLabels[last.action] || plain(last.action) || '继续观察' : '等待分析');
-    const action = last?.action || '';
-    classed($('decision-action'), 'positive', action === 'open_long'); classed($('decision-action'), 'negative', action === 'open_short');
-    const matchingRecord = last?.request_id ? latestDecisions.find((record) => record.request_id === last.request_id) : latestDecisions[0];
-    text('decision-time', last ? time(first(isoTime(last), isoTime(matchingRecord))) : '—');
-    text('decision-reason', last ? readableAI(first(last.reason, last.rationale, last.message)) || '本次未提供判断理由。' : '启动自动模拟后，AI 将结合行情、持仓与风险信息作出判断。');
-    const execution = last?.execution;
-    const executionElement = $('decision-execution');
-    executionElement.hidden = !execution;
-    executionElement.replaceChildren();
-    if (execution) {
-      executionElement.append(el('span', 'badge ' + (execution.status === 'executed' || execution.status === 'filled' ? 'badge-green' : execution.status === 'blocked' || execution.status === 'rejected' ? 'badge-amber' : 'badge-neutral'), statusLabels[execution.status] || '仅分析'));
-      if (execution.reason) executionElement.append(el('span', '', plain(execution.reason)));
+    text('ai-title', ai.daily_rules ? 'Luna 今日规则' : 'Luna 信号审核');
+    text('decision-caption', ai.daily_rules ? '当日市场判断' : '最近一次判断');
+    text('risk-caption', ai.daily_rules ? '当前执行参数' : '持仓风险评估');
+    if (ai.daily_rules) {
+      renderDailyAI(ai, calendar);
+    } else {
+      const latestDecisions = array(ai.decisions).filter((record) => unpack(record).action);
+      const lastRaw = ai.last_decision && unpack(ai.last_decision).action ? ai.last_decision : latestDecisions[0];
+      const last = lastRaw ? unpack(lastRaw) : null;
+      const statusMap = { analyzing: '分析中', running: '分析中', ready: '就绪', idle: '等待下一次', paused: '已暂停', error: '调用异常', failed: '调用异常', budget_exhausted: '今日预算已满', budget_blocked: '预算受限', waiting: '等待分析', waiting_market: '等待行情', market_closed: '休市等待' };
+      const status = ai.status || (last ? 'idle' : 'waiting');
+      text('ai-status', statusMap[status] || status);
+      $('ai-status').className = 'badge ' + (['error', 'failed'].includes(status) || /失败|异常/.test(status) ? 'badge-red' : ['budget_exhausted', 'budget_blocked'].includes(status) || /预算/.test(status) ? 'badge-amber' : runtime.model_busy || ['analyzing', 'running'].includes(status) ? 'badge-blue loading-pulse' : 'badge-neutral');
+      text('decision-action', last ? actionLabels[last.action] || plain(last.action) || '继续观察' : '等待分析');
+      const action = last?.action || '';
+      classed($('decision-action'), 'positive', action === 'open_long'); classed($('decision-action'), 'negative', action === 'open_short');
+      const matchingRecord = last?.request_id ? latestDecisions.find((record) => record.request_id === last.request_id) : latestDecisions[0];
+      text('decision-time', last ? time(first(isoTime(last), isoTime(matchingRecord))) : '—');
+      text('decision-reason', last ? readableAI(first(last.reason, last.rationale, last.message)) || '本次未提供判断理由。' : '启动自动模拟后，AI 将结合行情、持仓与风险信息作出判断。');
+      const execution = last?.execution;
+      const executionElement = $('decision-execution');
+      executionElement.hidden = !execution;
+      executionElement.replaceChildren();
+      if (execution) {
+        executionElement.append(el('span', 'badge ' + (execution.status === 'executed' || execution.status === 'filled' ? 'badge-green' : execution.status === 'blocked' || execution.status === 'rejected' ? 'badge-amber' : 'badge-neutral'), statusLabels[execution.status] || '仅分析'));
+        if (execution.reason) executionElement.append(el('span', '', plain(execution.reason)));
+      }
+      const risk = String(first(last?.risk_level, last?.risk?.level, 'unknown')).toLowerCase();
+      text('risk-level', last ? riskLabels[risk] || '未知' : '待评估');
+      $('risk-level').className = 'risk-tag ' + (['low', 'medium', 'high'].includes(risk) ? risk : risk === 'moderate' ? 'medium' : risk === 'critical' ? 'high' : '');
+      text('closure-assessment', last ? readableAI(first(last.closure_assessment, last.overnight_risk, last.risk?.closure_assessment)) || '本次未提供休市风险结论，相关风险信息仍需留意。' : '允许隔夜、跨周末和长假持仓，休市风险纳入 AI 判断。');
+      const riskDetails = $('risk-details'); riskDetails.replaceChildren();
+      if (num(calendar.closure_hours) !== null && calendar.closure_hours > 0) riskDetails.append(el('span', '', '预计休市 ' + Number(calendar.closure_hours).toFixed(1) + ' 小时'));
+      if (calendar.is_weekend_or_holiday) riskDetails.append(el('span', '', '周末 / 长假风险'));
+      if (calendar.known_events_status === 'unknown' || calendar.known_events_status === 'unavailable') riskDetails.append(el('span', '', '事件信息未知'));
+      if (calendar.calendar_verified === false || calendar.exchange_calendar_verified === false) riskDetails.append(el('span', '', '交易日历待核验'));
     }
-    const risk = String(first(last?.risk_level, last?.risk?.level, 'unknown')).toLowerCase();
-    text('risk-level', last ? riskLabels[risk] || '未知' : '待评估');
-    $('risk-level').className = 'risk-tag ' + (['low', 'medium', 'high'].includes(risk) ? risk : risk === 'moderate' ? 'medium' : risk === 'critical' ? 'high' : '');
-    text('closure-assessment', last ? readableAI(first(last.closure_assessment, last.overnight_risk, last.risk?.closure_assessment)) || '本次未提供休市风险结论，相关风险信息仍需留意。' : '允许隔夜、跨周末和长假持仓，休市风险纳入 AI 判断。');
-    const riskDetails = $('risk-details'); riskDetails.replaceChildren();
-    if (num(calendar.closure_hours) !== null && calendar.closure_hours > 0) riskDetails.append(el('span', '', '预计休市 ' + Number(calendar.closure_hours).toFixed(1) + ' 小时'));
-    if (calendar.is_weekend_or_holiday) riskDetails.append(el('span', '', '周末 / 长假风险'));
-    if (calendar.known_events_status === 'unknown' || calendar.known_events_status === 'unavailable') riskDetails.append(el('span', '', '事件信息未知'));
-    if (calendar.calendar_verified === false || calendar.exchange_calendar_verified === false) riskDetails.append(el('span', '', '交易日历待核验'));
     const usage = ai.usage || {};
     const spent = num(first(usage.spent_usd, usage.cost_usd, usage.actual_cost_usd, usage.total_cost_usd, usage.used_usd));
     const reserved = num(first(usage.reserved_or_uncertain_usd, usage.reserved_usd, usage.reserved_cost_usd, 0));
@@ -287,6 +297,34 @@
     const requests = num(first(usage.requests, usage.request_count, usage.calls));
     text('model-token-count', (tokens === null ? '暂无调用用量' : count(tokens) + ' token' + (requests === null ? '' : ' · ' + count(requests) + ' 次调用')) + (reserved > 0 ? ' · 含预留' : ''));
     text('model-name', first(ai.model_name, ai.model) === 'gpt-6-luna' || !first(ai.model_name, ai.model) ? 'GPT-6 Luna' : first(ai.model_name, ai.model));
+  }
+
+  function renderDailyAI(ai, calendar) {
+    const daily = ai.daily_rules;
+    const names = { ready: '已生成', generating: '生成中', fallback: '基础规则运行', waiting: '等待生成' };
+    const regimes = { normal: '常态市场', risk_off: '风险偏好下降', volatile: '波动上升', mixed: '市场信号分化' };
+    text('ai-status', names[daily.status] || '等待生成');
+    $('ai-status').className = 'badge ' + ({ ready: 'badge-green', generating: 'badge-blue loading-pulse', fallback: 'badge-amber' }[daily.status] || 'badge-neutral');
+    text('decision-action', daily.status === 'ready' ? regimes[daily.regime] || '已生成' : names[daily.status]);
+    $('decision-action').classList.remove('positive', 'negative');
+    text('decision-time', time(daily.generated_at, true));
+    text('decision-reason', daily.summary || daily.message);
+    const execution = $('decision-execution');
+    const last = ai.last_decision;
+    execution.hidden = last?.origin !== 'rules';
+    execution.replaceChildren();
+    if (last?.origin === 'rules') {
+      execution.append(el('span', 'badge badge-neutral', '最近规则执行'), el('span', '',
+        time(last.created_at, true) + ' · ' + (actionLabels[last.action] || last.action) + ' · ' + (last.execution?.reason || last.reason)));
+    }
+    text('risk-level', daily.base.version);
+    $('risk-level').className = 'risk-tag';
+    const policy = daily.strategy.execution;
+    text('closure-assessment', '净盈亏比至少 ' + policy.minimum_net_reward_risk + '，亏损后冷却 ' + policy.loss_cooldown_minutes + ' 分钟。信号与止损止盈由程序统一执行。');
+    const details = $('risk-details'); details.replaceChildren();
+    details.append(el('span', '', daily.trading_day), el('span', '', '已尝试 ' + daily.attempts + ' 次'));
+    if (daily.error_code) details.append(el('span', '', '生成异常 · ' + daily.error_code));
+    if (!calendar.calendar_verified) details.append(el('span', '', '交易日历待核验'));
   }
 
   function renderPosition(position, account) {
@@ -381,7 +419,18 @@
       description = parts.join(' · ');
     }
     text('strategy-description', description || '新策略经独立验证和并行模拟后才会启用；既有持仓保留开仓时的管理计划。');
+    const dailyMode = strategy.mode === 'daily';
+    text('strategy-title', dailyMode ? '今日规则与市场依据' : '策略迭代');
+    text('strategy-nav-label', dailyMode ? '今日规则' : '策略迭代');
+    text('strategy-kicker', dailyMode ? 'DAILY RULES' : 'STRATEGY EVOLUTION');
+    $('evolution-steps').hidden = dailyMode;
+    $('strategy').parentElement.classList.toggle('daily-strategy-layout', dailyMode);
+    const parametersOpen = $('strategy-candidates').querySelector('.daily-parameters')?.open ?? true;
     const container = $('strategy-candidates'); container.replaceChildren();
+    if (dailyMode) {
+      renderDailyStrategy(strategy, container, parametersOpen);
+      return;
+    }
     const candidates = array(first(strategy.candidates, strategy.pending_candidates));
     if (!candidates.length) container.append(el('p', 'empty-description', plain(first(strategy.message, strategy.wait_reason)) || '暂无候选策略，等待数据积累。'));
     for (const raw of candidates.slice(0, 4)) {
@@ -398,6 +447,70 @@
       row.append(copy, el('span', 'badge ' + (status === 'promoted' || status === 'passed' ? 'badge-green' : status === 'rejected' || status === 'rolled_back' ? 'badge-amber' : 'badge-neutral'), statusLabels[status] || '验证中')); container.append(row);
     }
     text('strategy-state', plain(first(strategy.last_review?.message, strategy.last_review?.reason, strategy.last_event, strategy.last_update_message, strategy.rollback_reason)) || '仓位、亏损上限与成本假设独立于策略优化。');
+  }
+
+  function renderDailyStrategy(strategy, container, parametersOpen) {
+    const daily = strategy.daily;
+    const base = { ...strategy.base.parameters, ...strategy.base.execution };
+    const current = { ...strategy.current.parameters, ...strategy.current.execution };
+    const labels = { trend_fast: '5分钟快均线', trend_slow: '5分钟慢均线', entry_ma: '1分钟入场均线', atr_period: 'ATR窗口',
+      stop_atr: '止损ATR倍数', reward_risk: '目标毛盈亏比', pullback_atr: '回调ATR容差', min_trend_atr: '最小趋势ATR差',
+      loss_cooldown_minutes: '亏损后冷却（分钟）', minimum_net_reward_risk: '最低净盈亏比' };
+    const parameters = el('details', 'daily-parameters');
+    parameters.open = parametersOpen;
+    parameters.append(el('summary', '', 'v2 基础参数与今日参数'));
+    const table = el('table'); const head = el('thead'); const headings = el('tr');
+    for (const name of ['参数', 'v2 基础', '今日']) headings.append(el('th', '', name));
+    head.append(headings); table.append(head);
+    const body = el('tbody');
+    for (const [name, value] of Object.entries(current)) {
+      const row = el('tr', value !== base[name] ? 'parameter-changed' : '');
+      row.append(cell(labels[name] || name), cell(base[name], 'number'), cell(value, 'number'));
+      body.append(row);
+    }
+    table.append(body); parameters.append(table); container.append(parameters);
+    container.append(el('p', 'daily-meta', daily.status === 'ready'
+      ? (daily.changes.length ? '今日调整 ' + daily.changes.length + ' 项参数。' : '今日采用 v2 基础参数。')
+      : daily.message));
+    const factors = array(daily.market?.factors);
+    if (factors.length) {
+      container.append(el('h3', 'daily-subheading', '全球市场快照'), el('p', 'daily-meta', '获取于 ' + time(daily.market.as_of, true) + ' · 以下报价时间均为北京时间'));
+      const grid = el('div', 'factor-grid');
+      for (const factor of factors) {
+        const item = el('article', 'factor-card');
+        item.append(el('h4', '', factor.name));
+        const value = num(factor.value);
+        const change = num(factor.change_pct);
+        const factorFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: factor.id === 'usdcnh' ? 4 : 3 });
+        item.append(el('strong', '', value === null ? '暂缺' : factorFormat.format(value) + ' ' + factor.unit));
+        item.append(el('span', change > 0 ? 'positive' : change < 0 ? 'negative' : '', change === null ? '日变动未知' : '日变动 ' + (change > 0 ? '+' : '') + money(change) + '%'));
+        const fiveSessionChange = num(factor.five_session_change_pct);
+        if (fiveSessionChange !== null) item.append(el('p', '', '近5个交易时段 ' + (fiveSessionChange > 0 ? '+' : '') + money(fiveSessionChange) + '%'));
+        item.append(el('p', '', time(factor.observed_at, true) + ' · ' + ({ available: '可用', stale: '已过时', unavailable: '获取失败' }[factor.status] || '待核验')));
+        if (num(factor.age_hours) !== null) item.append(el('p', '', '距获取时间 ' + factor.age_hours + ' 小时'));
+        const source = el('a', 'factor-source', factor.provider === 'sina' ? '新浪财经 ↗' : 'Yahoo Finance ↗');
+        try {
+          const url = new URL(factor.source_url);
+          if (url.protocol === 'https:' && ['hq.sinajs.cn', 'query1.finance.yahoo.com'].includes(url.hostname)) {
+            source.href = url.href; source.target = '_blank'; source.rel = 'noopener noreferrer';
+          }
+        } catch (_) { /* Keep the provider label when no valid source URL is available. */ }
+        item.append(source); grid.append(item);
+      }
+      container.append(grid);
+    }
+    if (array(daily.evidence).length) {
+      container.append(el('h3', 'daily-subheading', 'Luna 判断依据'));
+      const evidence = el('ul', 'daily-evidence');
+      for (const item of daily.evidence) {
+        const factor = factors.find((value) => value.id === item.factor);
+        evidence.append(el('li', '', (factor?.name || item.factor) + ' · ' + item.interpretation));
+      }
+      container.append(evidence);
+    }
+    const limits = [...new Set([...array(daily.market?.limitations), ...array(daily.limitations)])];
+    if (limits.length) container.append(el('p', 'daily-limitations', limits.join(' ')));
+    text('strategy-state', daily.message + (daily.valid_until ? ' 适用至 ' + time(daily.valid_until, true) + '。' : ''));
   }
 
   function renderReviews(input) {
@@ -464,7 +577,8 @@
     $('freshness-dot').className = 'status-dot' + (age !== null && age >= -2 && age <= 10 && open ? ' live' : age !== null && open ? ' warning' : '');
     const nextDate = dateOf(state.ai?.next_analysis_at);
     const running = Boolean(first(state.runtime?.running, state.runtime?.auto_trading_enabled, false));
-    if (state.runtime?.model_busy || ['analyzing', 'running'].includes(state.ai?.status)) text('next-analysis', '模型任务进行中');
+    if (state.ai?.daily_rules && !state.ai.daily_rules.active) text('next-analysis', '等待今日规则');
+    else if (!state.ai?.daily_rules && (state.runtime?.model_busy || ['analyzing', 'running'].includes(state.ai?.status))) text('next-analysis', '模型任务进行中');
     else if (!running) text('next-analysis', '自动模拟已暂停');
     else if (!open) text('next-analysis', '等待交易时段');
     else if (nextDate) { const seconds = Math.max(0, Math.ceil((nextDate.getTime() - now.getTime()) / 1000)); text('next-analysis', seconds > 0 ? seconds + ' 秒后' : '等待本地信号检查'); }

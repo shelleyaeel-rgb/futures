@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Mapping
 
+from .strategy import PARAMETER_BOUNDS, finite_number, protection_prices, validate_execution, validate_parameters
 
 TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 ZERO = Decimal("0")
@@ -482,7 +483,7 @@ class PaperBroker:
 
     def _order(self, decision, q, status, reason, origin, code=None, fill_price=None):
         safe_decision = {key: decision.get(key) for key in (
-            "action", "stop_loss", "take_profit", "reason", "strategy_version", "limit_price") if key in decision}
+            "action", "stop_loss", "take_profit", "reason", "strategy_version", "limit_price", "rule_plan") if key in decision}
         key_data = {"symbol": q.get("symbol"), "quote_time": q.get("datetime"), "status": status,
                     "action": decision.get("action"), "origin": origin, "code": code or reason,
                     "stop_loss": decision.get("stop_loss"), "take_profit": decision.get("take_profit")}
@@ -502,7 +503,8 @@ class PaperBroker:
         return {"status": status, "reason": reason, "executed": status == "executed",
                 **extra, **self._snapshot(account, position, load=False)}
 
-    def _blocked(self, decision, q, reason, account, position, origin="ai", code=None):
+    def _blocked(self, decision, q, reason, account, position, origin=None, code=None):
+        origin = origin or decision.get("origin", "ai")
         order_id = self._order(decision, q, "blocked", reason, origin, code)
         return self._result("blocked", reason, account, position, order_id=order_id)
 
@@ -686,7 +688,7 @@ class PaperBroker:
         return self._result("protection_updated" if changed else "held", "保护价已更新。" if changed else "保持当前持仓。", account, position)
 
     def execute(self, decision: dict, quote: dict, indicators: dict | None = None) -> dict:
-        del indicators  # Indicators never override ledger or program risk limits.
+        del indicators  # The rule plan carries its closed-bar ATR explicitly.
         with self._transaction():
             account, position, q, risk_action, error = self._observe(quote)
             if not isinstance(decision, Mapping):
@@ -705,7 +707,7 @@ class PaperBroker:
                     return self._result("held", "当前空仓，无需重复平仓。", account, None)
                 if decision.get("strategy_version") and decision["strategy_version"] != position["strategy_version"]:
                     return self._blocked(decision, q, "平仓决策必须使用当前持仓的策略版本。", account, position)
-                _, result = self._fill_close(account, position, q, decision, "ai")
+                _, result = self._fill_close(account, position, q, decision, decision.get("origin", "ai"))
                 return result
             if position:
                 return self._blocked(decision, q, "已有1手持仓；不加仓、不同时持有多空，也不隐式换月。", account, position)
@@ -728,6 +730,28 @@ class PaperBroker:
             price, fill_error = self._fill_price(q, buy, self.costs, decision.get("limit_price"))
             if fill_error:
                 return self._blocked(decision, q, fill_error, account, position)
+            rule_plan = decision.get("rule_plan")
+            if rule_plan is not None:
+                try:
+                    if not isinstance(rule_plan, dict) or set(rule_plan) != {"parameters", "execution", "atr"}:
+                        raise ValueError("Invalid rule plan")
+                    if set(rule_plan["parameters"]) != set(PARAMETER_BOUNDS):
+                        raise ValueError("Incomplete rule parameters")
+                    parameters = validate_parameters(rule_plan["parameters"])
+                    policy = validate_execution(rule_plan["execution"])
+                    atr = rule_plan["atr"]
+                    if not finite_number(atr) or atr <= 0:
+                        raise ValueError("Invalid ATR")
+                    stop_price, target_price = protection_prices(price, q["price_tick"], 1 if buy else -1, atr, parameters)
+                except (ValueError, KeyError, TypeError):
+                    return self._blocked(decision, q, "规则保护计划校验失败。", account, position)
+                decision = {**decision, "stop_loss": stop_price, "take_profit": target_price}
+                last_row = self._db.execute("SELECT payload FROM paper_trades ORDER BY id DESC LIMIT 1").fetchone()
+                last_trade = json.loads(last_row[0]) if last_row else {}
+                closed_at = _dt(last_trade.get("quote_time"))
+                if (last_trade.get("action") == "close" and _d(last_trade.get("net_pnl"), ZERO) < ZERO
+                        and closed_at and (_dt(q["datetime"]) - closed_at).total_seconds() < policy["loss_cooldown_minutes"] * 60):
+                    return self._blocked(decision, q, f"亏损后冷却{policy['loss_cooldown_minutes']}分钟，等待下一次规则检查。", account, position)
             stop = _d(decision.get("stop_loss"))
             target = _d(decision.get("take_profit"))
             tick, multiplier = q["price_tick"], q["volume_multiple"]
@@ -755,6 +779,12 @@ class PaperBroker:
             if risk > self.trade_risk_limit:
                 return self._blocked(decision, q, f"单笔计划风险含进出费用及止损滑点为{risk}元，超过{self.trade_risk_limit}元，拒绝开仓。", account, position)
             direction = 1 if buy else -1
+            if rule_plan is not None:
+                target_fill = target - direction * exit_allowance
+                target_fees = self._fees(target_fill, multiplier, closing_kind, self.costs)
+                expected_net = (target_fill - price) * direction * multiplier - fees["total"] - target_fees["total"]
+                if expected_net < risk * _d(policy["minimum_net_reward_risk"]):
+                    return self._blocked(decision, q, f"扣费后目标盈亏比低于{policy['minimum_net_reward_risk']}，等待下一次信号。", account, position)
             equity_after = _d(account["cash"]) - fees["total"] + (q["last_price"] - price) * multiplier * direction
             margin = q["last_price"] * multiplier * _d(self.costs["margin_rate"])
             if equity_after < margin:
@@ -775,13 +805,14 @@ class PaperBroker:
                 "open_fees": fees["total"], "planned_risk": risk,
                 "cost_assumptions": copy.deepcopy(self.costs), "pending_exit": None,
             }
-            order_id = self._order(decision, q, "filled", reason, "ai", fill_price=price)
+            origin = decision.get("origin", "ai")
+            order_id = self._order(decision, q, "filled", reason, origin, fill_price=price)
             trade = {"time": self._now().isoformat(), "quote_time": q["datetime"], "symbol": q["symbol"],
                      "trading_day": q["trading_day"], "action": action, "side": position["side"],
                      "quantity": 1, "price": price, "gross_pnl": ZERO, "net_pnl": None,
                      "net_pnl_scope": "open_position_not_closed", "cash_delta": -fees["total"],
                      "fees": fees, "strategy_version": position["strategy_version"],
-                     "reason": reason, "origin": "ai", "order_id": order_id,
+                     "reason": reason, "origin": origin, "order_id": order_id,
                      "assumption_version": self.costs["assumption_version"],
                      "cost_assumptions": copy.deepcopy(self.costs), "planned_risk": risk}
             cursor = self._db.execute("INSERT INTO paper_trades(symbol,quote_time,payload) VALUES(?,?,?)",

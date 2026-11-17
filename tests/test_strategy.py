@@ -1,5 +1,5 @@
 import unittest
-from futures_app.strategy import (build_context, closed_bars, default_strategy,
+from futures_app.strategy import (base_strategy_v2, baseline_decision, build_context, closed_bars, default_strategy,
                                   validate_parameters, timestamp)
 
 
@@ -10,6 +10,19 @@ def make_bars(start, count, duration=60):
 
 
 class StrategyTests(unittest.TestCase):
+    def test_v2_requires_fresh_closed_bars_and_carries_execution_policy(self):
+        end = 1_800_000_000
+        one = make_bars(end - 60 * 60, 60)
+        five = make_bars(end - 50 * 300, 50, 300)
+        quote = {"datetime": end, "bid_price1": 4059.8, "ask_price1": 4060.2, "price_tick": 0.2}
+        context = build_context(quote, one, five, {}, {}, base_strategy_v2())
+        self.assertTrue(context["data_ready"])
+        self.assertEqual(baseline_decision(context)["rule_plan"]["execution"]["loss_cooldown_minutes"], 10)
+        for bars1, bars5 in ((one[:-2], five), (one, five[:-2])):
+            stale = build_context(quote, bars1, bars5, {}, {}, base_strategy_v2())
+            self.assertFalse(stale["data_ready"])
+            self.assertEqual(baseline_decision(stale)["action"], "hold")
+
     def test_in_progress_and_future_bars_do_not_change_indicators(self):
         end = 1_800_000_000
         one = make_bars(end - 60 * 60, 60)
