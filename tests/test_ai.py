@@ -8,6 +8,7 @@ from unittest.mock import patch
 import urllib.error
 
 from futures_app.ai import LunaAnalyst, validate_decision
+from futures_app.common import ROOT
 from futures_app.strategy import base_strategy_v2
 
 
@@ -44,7 +45,13 @@ class AnalystTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="futures-ai-test-")
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "test.sqlite3"
-        self.analyst = LunaAnalyst(self.path, {"model": "gpt-6-luna", "daily_budget_usd": 2})
+        self.analyst = LunaAnalyst(self.path, {})
+
+    def test_shipped_model_matches_default_and_verified_prices(self):
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        analyst = LunaAnalyst(self.path, config)
+        self.assertEqual(analyst.model, self.analyst.model)
+        self.assertEqual(analyst._prices(), (2.0, 10.0))
 
     def test_daily_generation_is_structured_and_rejects_unsupported_changes(self):
         daily_context = {"base_strategy": base_strategy_v2(), "global_market": {
@@ -71,13 +78,15 @@ class AnalystTests(unittest.TestCase):
             result = self.analyst.analyze(context(), "synthetic-key-only")
         self.assertEqual(result["status"], "ok")
         request = json.loads(opener.request.data)
+        self.assertEqual(request["model"], "gpt-6.2-sol")
         self.assertFalse(request["store"])
+        self.assertEqual(request["prompt_cache_options"], {"mode": "explicit"})
         self.assertTrue(request["text"]["format"]["strict"])
         self.assertEqual(request["reasoning"], {"effort": "low"})
         usage = self.analyst.usage_today()
         self.assertEqual(usage["output_tokens"], 40)
         self.assertEqual(usage["reasoning_tokens"], 30)
-        self.assertAlmostEqual(usage["spent_usd"], 0.00003)
+        self.assertAlmostEqual(usage["spent_usd"], 0.0006)
 
     def test_timeout_retains_budget_and_does_not_echo_exception(self):
         with patch("urllib.request.build_opener") as factory:

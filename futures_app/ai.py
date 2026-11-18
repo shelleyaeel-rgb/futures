@@ -17,9 +17,14 @@ from .daily_rules import DAILY_BOUNDS, validate_daily_result
 from .global_market import FACTORS
 
 API_ENDPOINT = "https://api.openai.com/v1/responses"
-# Standard processing prices checked against official documentation on 2026-10-30.
-MODEL_PRICES = {"gpt-6-luna": (0.10, 0.50), "gpt-6.1-sol": (2.0, 10.0)}
-PRICE_VERIFIED_DATE = "2026-10-30"
+DEFAULT_MODEL = "gpt-6.2-sol"
+# Standard uncached input and output prices in USD per million tokens.
+MODEL_PRICES = {
+    "gpt-6.2-sol": (2.0, 10.0),
+    "gpt-6.1-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.10, 0.50),
+}
+PRICE_VERIFIED_DATE = "2026-11-18"
 _UNIT = 1_000_000_000
 _MAX_BODY = 1024 * 1024
 
@@ -122,7 +127,7 @@ class LunaAnalyst:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.config = dict(config["model"] if isinstance(config.get("model"), dict) else config)
-        self.model = self.config.get("model", "gpt-6-luna")
+        self.model = self.config.get("model", DEFAULT_MODEL)
         with self._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS ai_usage (
@@ -246,6 +251,8 @@ class LunaAnalyst:
                 "input": json.dumps(context, ensure_ascii=False, allow_nan=False),
                 "reasoning": {"effort": "low"}, "max_output_tokens": output_limit,
                 "store": False, "service_tier": "default",
+                # With no breakpoints this avoids cache-write charges outside the budgeted rate.
+                "prompt_cache_options": {"mode": "explicit"},
                 "text": {"format": {"type": "json_schema", "name": "futures_" + kind,
                                     "strict": True, "schema": schema}},
             }, ensure_ascii=False, allow_nan=False).encode("utf-8")

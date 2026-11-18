@@ -9,7 +9,7 @@ import threading
 import time
 
 from futures_probe.secrets import get_secret
-from .ai import LunaAnalyst
+from .ai import DEFAULT_MODEL, LunaAnalyst
 from .broker import PaperBroker
 from .calendar import ExchangeCalendar
 from .common import ROOT, connect_db, iso_now, now_china, parse_time, safe_json
@@ -188,7 +188,7 @@ class TradingService:
                     self.runtime["model_busy"] = False
                 self._model_lock.release()
 
-        thread = threading.Thread(target=job, name="luna-task", daemon=True)
+        thread = threading.Thread(target=job, name="model-task", daemon=True)
         self._threads = [item for item in self._threads if item.is_alive()]
         self._threads.append(thread)
         thread.start()
@@ -270,7 +270,7 @@ class TradingService:
                 self.db.commit()
             self.broker.record_event("analysis", str(decision.get("reason", "已完成一次模型分析。"))[:1000], {"action": decision.get("action"), "execution": decision.get("execution")})
 
-        return self._launch_model_job(task, "Luna 正在审核信号" if signal_only else "Luna 正在分析")
+        return self._launch_model_job(task, "正在审核信号" if signal_only else "正在分析")
 
     def request_daily_rules(self, *, force: bool = False) -> dict:
         calendar = self.calendar.context()
@@ -313,7 +313,7 @@ class TradingService:
             with self._lock:
                 self.ai_state["status"] = daily["message"]
 
-        return self._launch_model_job(task, "Luna 正在生成今日规则")
+        return self._launch_model_job(task, "正在生成今日规则")
 
     def _execute_rules(self) -> dict:
         market, calendar, quote = self._market()
@@ -433,7 +433,8 @@ class TradingService:
             runtime = copy.deepcopy(self.runtime)
             ai = copy.deepcopy(self.ai_state)
             rows = self.db.execute("SELECT id,trading_day,created_at,payload FROM app_reviews ORDER BY id DESC LIMIT 20").fetchall()
-        ai.update(usage=self.analyst.usage_today(), decisions=self.analyst.recent_decisions(limit=30), model=self.config["model"]["model"])
+        ai.update(usage=self.analyst.usage_today(), decisions=self.analyst.recent_decisions(limit=30),
+                  model=self.config["model"].get("model", DEFAULT_MODEL))
         strategy = self.evolution.state()
         if self.daily_enabled:
             daily = self.daily_rules.state(now_china().date().isoformat())

@@ -248,7 +248,7 @@
   }
 
   function renderAI(ai, calendar, runtime) {
-    text('ai-title', ai.daily_rules ? 'Luna 今日规则' : 'Luna 信号审核');
+    text('ai-title', ai.daily_rules ? '今日规则' : '信号审核');
     text('decision-caption', ai.daily_rules ? '当日市场判断' : '最近一次判断');
     text('risk-caption', ai.daily_rules ? '当前执行参数' : '持仓风险评估');
     if (ai.daily_rules) {
@@ -296,7 +296,7 @@
     const tokens = num(first(usage.total_tokens, (num(usage.input_tokens) !== null && num(usage.output_tokens) !== null) ? Number(usage.input_tokens) + Number(usage.output_tokens) : null));
     const requests = num(first(usage.requests, usage.request_count, usage.calls));
     text('model-token-count', (tokens === null ? '暂无调用用量' : count(tokens) + ' token' + (requests === null ? '' : ' · ' + count(requests) + ' 次调用')) + (reserved > 0 ? ' · 含预留' : ''));
-    text('model-name', first(ai.model_name, ai.model) === 'gpt-6-luna' || !first(ai.model_name, ai.model) ? 'GPT-6 Luna' : first(ai.model_name, ai.model));
+    text('model-name', first(ai.model_name, ai.model, usage.model));
   }
 
   function renderDailyAI(ai, calendar) {
@@ -500,7 +500,7 @@
       container.append(grid);
     }
     if (array(daily.evidence).length) {
-      container.append(el('h3', 'daily-subheading', 'Luna 判断依据'));
+      container.append(el('h3', 'daily-subheading', '判断依据'));
       const evidence = el('ul', 'daily-evidence');
       for (const item of daily.evidence) {
         const factor = factors.find((value) => value.id === item.factor);
